@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """Limpia la lista iptv-org: solo canales en español latinoamericano,
-solo streams ESTABLES, y una sola fuente (la mejor) por canal.
+solo streams ESTABLES y LIVIANOS, y una sola fuente (la mejor) por canal.
+
+Pensado para conexiones de ~5 Mbps: descarta canales que necesitan más de
+~3 Mbps y, cuando el canal ofrece varias calidades, deja fija la liviana.
 
 Dos etapas:
   1. Prueba rápida: ¿el stream responde?
-  2. Prueba de estabilidad: descarga varios fragmentos y mide si llegan más
-     rápido de lo que se reproducen, y confirma que el en vivo realmente
-     avanza. Descarta los que se congelan o repiten.
+  2. Prueba de estabilidad: descarga varios fragmentos, mide su bitrate y si
+     llegan más rápido de lo que se reproducen, y confirma que el en vivo
+     realmente avanza.
 
 Uso:
     pip install requests
@@ -29,7 +32,9 @@ TIMEOUT = 8
 HILOS = 40            # etapa 1
 HILOS_ESTABLE = 30    # etapa 2
 MAX_LATENCIA = 6.0    # segundos (etapa 1)
-BW_MAX = 3_000_000    # bits/s: variante HLS que se prueba (pensado para móvil)
+BW_MAX = 2_500_000    # bits/s: variante HLS preferida (liviana)
+MAX_BITRATE = 3_000_000  # bits/s: más que esto se descarta (conexión ~5 Mbps)
+MAX_KBPS = MAX_BITRATE / 8 / 1024 * 1.3  # tope en streams directos (KB/s)
 RATIO_MAX = 0.7       # tiempo de descarga / duración del fragmento
 VENTANA = 8           # segundos de prueba para streams directos
 KBPS_MIN = 30         # velocidad mínima sostenida en streams directos
@@ -107,11 +112,15 @@ def probar(canal):
 
 # ------------------------------------------------- etapa 2: ¿es estable?
 def leer_hls(url, h):
-    """Devuelve (texto, url_base) de la lista de medios, eligiendo variante."""
+    """Devuelve (texto, url_base, variante_fijada) de la lista de medios.
+
+    Si la lista es maestra (varias calidades) elige la liviana y devuelve su
+    URL como `variante_fijada`; si no, `variante_fijada` es None.
+    """
     r = get(url, h)
     if r.status_code != 200 or "#EXTM3U" not in r.text:
         return None
-    texto, base = r.text, r.url
+    texto, base, fijada = r.text, r.url, None
     if "#EXT-X-STREAM-INF" in texto:
         lineas = texto.splitlines()
         variantes = []
@@ -127,12 +136,22 @@ def leer_hls(url, h):
         if not variantes:
             return None
         aptas = [v for v in variantes if 0 < v[0] <= BW_MAX]
-        elegido = max(aptas)[1] if aptas else min(variantes)[1]
+        if aptas:
+            elegido = max(aptas)[1]
+        else:
+            sin_bw = [v for v in variantes if v[0] == 0]
+            if sin_bw:
+                elegido = sin_bw[0][1]
+            else:
+                menor = min(variantes)
+                if menor[0] > MAX_BITRATE:
+                    return None  # ni su calidad más baja cabe en tu conexión
+                elegido = menor[1]
         r = get(elegido, h)
         if r.status_code != 200:
             return None
-        texto, base = r.text, r.url
-    return texto, base
+        texto, base, fijada = r.text, r.url, elegido
+    return texto, base, fijada
 
 
 def parsear_media(texto, base):
@@ -160,11 +179,12 @@ def estable_hls(url, h):
     res = leer_hls(url, h)
     if not res:
         return None
-    segs, seq, fin = parsear_media(*res)
+    texto, base, fijada = res
+    segs, seq, fin = parsear_media(texto, base)
     if fin or len(segs) < 2:  # VOD o lista sin contenido: no es en vivo
         return None
 
-    ratios = []
+    ratios, bitrates = [], []
     for uri, dur in segs[-3:]:
         t0 = time.time()
         r = get(uri, h, timeout=12, stream=True)
@@ -179,8 +199,11 @@ def estable_hls(url, h):
         if total < 2000:
             return None
         ratios.append((time.time() - t0) / max(dur, 1.0))
+        bitrates.append(total * 8 / max(dur, 1.0))
     media = sum(ratios) / len(ratios)
     if media > RATIO_MAX or max(ratios) > 1.2:
+        return None
+    if sum(bitrates) / len(bitrates) > MAX_BITRATE:  # demasiado pesado
         return None
 
     # el en vivo debe avanzar (los canales "pegados" repiten lo mismo)
@@ -188,12 +211,15 @@ def estable_hls(url, h):
     res2 = leer_hls(url, h)
     if not res2:
         return None
-    segs2, seq2, _ = parsear_media(*res2)
+    segs2, seq2, _ = parsear_media(res2[0], res2[1])
     if not segs2:
         return None
     if seq2 <= seq and segs2[-1][0] == segs[-1][0]:
         return None
-    return 1.0 / max(media, 0.01)
+
+    # si hay varias calidades, fijar la liviana (si su URL no usa token)
+    url_final = fijada if fijada and "?" not in fijada else url
+    return 1.0 / max(media, 0.01), url_final
 
 
 def estable_directo(url, h):
@@ -213,11 +239,17 @@ def estable_directo(url, h):
     if sum(1 for c in cubos if c > 0) < VENTANA - 2:
         return None
     kbps = total / VENTANA / 1024
-    return kbps if kbps >= KBPS_MIN else None
+    if kbps < KBPS_MIN:
+        return None
+    mitad = VENTANA // 2
+    cola = sum(cubos[mitad:]) / (VENTANA - mitad) / 1024
+    if cola > MAX_KBPS:  # demasiado pesado para tu conexión
+        return None
+    return kbps, url
 
 
 def prueba_estable(canal):
-    """Devuelve una puntuación (mayor = mejor) o None si es inestable."""
+    """Devuelve (puntuación, url_final) o None si es inestable o pesado."""
     url, h = canal["url"], cabeceras(canal)
     try:
         return estable_hls(url, h) if es_hls(url) else estable_directo(url, h)
@@ -264,14 +296,14 @@ def main():
     vivos = [c for _, c in correr(probar, canales, HILOS, "etapa 1")]
     print(f"  {len(vivos)} responden.")
 
-    print("Etapa 2: ¿son estables? (tarda más)")
+    print("Etapa 2: ¿son estables y livianos? (tarda más)")
     estables = correr(prueba_estable, vivos, HILOS_ESTABLE, "etapa 2")
-    print(f"  {len(estables)} estables.")
+    print(f"  {len(estables)} pasan.")
 
     # una fuente por canal: la de mejor puntuación
     mejores = {}
-    for score, c in sorted(estables, key=lambda x: -x[0]):
-        mejores.setdefault(clave_canal(c), c)
+    for (score, url_final), c in sorted(estables, key=lambda x: -x[0][0]):
+        mejores.setdefault(clave_canal(c), dict(c, url=url_final))
 
     with open(SALIDA, "w", encoding="utf-8") as f:
         f.write("#EXTM3U\n")
@@ -280,7 +312,7 @@ def main():
             for o in c["opts"]:
                 f.write(o + "\n")
             f.write(c["url"] + "\n")
-    print(f"Listo: {len(mejores)} canales estables -> {SALIDA}")
+    print(f"Listo: {len(mejores)} canales -> {SALIDA}")
 
 
 if __name__ == "__main__":
