@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
 """Limpia la lista iptv-org: solo canales en español latinoamericano,
-solo streams ESTABLES y LIVIANOS, y una sola fuente (la mejor) por canal.
+solo streams ESTABLES, LIVIANOS y REPRODUCIBLES, y una sola fuente por canal.
 
-Pensado para conexiones de ~5 Mbps: descarta canales que necesitan más de
-~3 Mbps y, cuando el canal ofrece varias calidades, deja fija la liviana.
+Pensado para conexiones de ~5 Mbps y para teléfonos Android.
 
 Dos etapas:
   1. Prueba rápida: ¿el stream responde?
-  2. Prueba de estabilidad: descarga varios fragmentos, mide su bitrate y si
-     llegan más rápido de lo que se reproducen, y confirma que el en vivo
-     realmente avanza.
+  2. Prueba de calidad:
+     - descarga varios fragmentos y mide si llegan más rápido de lo que se
+       reproducen (si no, se congela),
+     - mide el bitrate (descarta los muy pesados),
+     - confirma que el en vivo realmente avanza,
+     - abre el fragmento y comprueba que trae VIDEO y AUDIO con códecs que
+       el teléfono reproduce (H.264/HEVC y AAC/MP3). Así se descartan los
+       canales de "solo audio", "solo video" y "reloj que corre sin imagen".
 
 Uso:
     pip install requests
@@ -35,9 +39,17 @@ MAX_LATENCIA = 6.0    # segundos (etapa 1)
 BW_MAX = 2_500_000    # bits/s: variante HLS preferida (liviana)
 MAX_BITRATE = 3_000_000  # bits/s: más que esto se descarta (conexión ~5 Mbps)
 MAX_KBPS = MAX_BITRATE / 8 / 1024 * 1.3  # tope en streams directos (KB/s)
-RATIO_MAX = 0.7       # tiempo de descarga / duración del fragmento
+RATIO_MAX = 0.6       # tiempo de descarga / duración del fragmento (promedio)
+RATIO_PICO = 1.0      # ningún fragmento puede tardar más de lo que dura
+MAX_SEG_DUR = 12      # fragmentos más largos hacen lento el arranque
 VENTANA = 8           # segundos de prueba para streams directos
 KBPS_MIN = 30         # velocidad mínima sostenida en streams directos
+
+# Tipos de stream MPEG-TS que un teléfono reproduce sin problemas.
+# (Se dejan fuera MPEG-2 video y AC-3/E-AC-3/DTS: muchos teléfonos no los
+#  decodifican y dan "solo audio" o "solo video".)
+VIDEO_OK = {0x1B, 0x24}               # H.264, HEVC
+AUDIO_OK = {0x0F, 0x11, 0x03, 0x04}   # AAC (ADTS/LATM), MP3
 
 
 # ---------------------------------------------------------------- utilidades
@@ -79,6 +91,73 @@ def get(url, h, timeout=TIMEOUT, **kw):
     return requests.get(url, headers=h, timeout=timeout, **kw)
 
 
+# ------------------------------------- contenido: ¿trae video Y audio?
+def _sync(data):
+    """Desfase donde empiezan los paquetes MPEG-TS de 188 bytes, o None."""
+    for i in range(188):
+        if (len(data) > i + 564 and data[i] == 0x47 and data[i + 188] == 0x47
+                and data[i + 376] == 0x47 and data[i + 564] == 0x47):
+            return i
+    return None
+
+
+def analizar_ts(data):
+    """None si `data` no es MPEG-TS. Si lo es, True/False según traiga video
+    y audio reproducibles (con datos reales de ambos)."""
+    off = _sync(data)
+    if off is None:
+        return None
+    pmt_pid, streams, datos = None, {}, {}
+    for k in range((len(data) - off) // 188):
+        p = data[off + k * 188: off + (k + 1) * 188]
+        if p[0] != 0x47:
+            continue
+        pid = ((p[1] & 0x1F) << 8) | p[2]
+        pusi = bool(p[1] & 0x40)
+        afc = (p[3] >> 4) & 3
+        i = 4
+        if afc & 2:
+            i += 1 + p[4]
+        if not (afc & 1) or i >= 187:
+            continue
+        datos[pid] = datos.get(pid, 0) + 1
+        try:
+            if pid == 0 and pmt_pid is None and pusi:
+                t = p[i + 1 + p[i]:]
+                if t[0] == 0:
+                    n = ((t[1] & 0x0F) << 8) | t[2]
+                    j = 8
+                    while j + 4 <= min(3 + n - 4, len(t)):
+                        prog = (t[j] << 8) | t[j + 1]
+                        if prog != 0:
+                            pmt_pid = ((t[j + 2] & 0x1F) << 8) | t[j + 3]
+                            break
+                        j += 4
+            elif pid == pmt_pid and pusi and not streams:
+                t = p[i + 1 + p[i]:]
+                if t[0] == 2:
+                    n = ((t[1] & 0x0F) << 8) | t[2]
+                    pil = ((t[10] & 0x0F) << 8) | t[11]
+                    j, fin = 12 + pil, min(3 + n - 4, len(t))
+                    while j + 5 <= fin:
+                        esl = ((t[j + 3] & 0x0F) << 8) | t[j + 4]
+                        streams[((t[j + 1] & 0x1F) << 8) | t[j + 2]] = t[j]
+                        j += 5 + esl
+        except IndexError:
+            continue
+    video = any(st in VIDEO_OK and datos.get(pid, 0) > 0
+                for pid, st in streams.items())
+    audio = any(st in AUDIO_OK and datos.get(pid, 0) > 0
+                for pid, st in streams.items())
+    return video and audio
+
+
+def analizar_mp4(data):
+    """Para fragmentos fMP4/CMAF: ¿el inicio declara video y audio comunes?"""
+    video = any(t in data for t in (b"avc1", b"avc3", b"hvc1", b"hev1"))
+    return video and b"mp4a" in data
+
+
 # ------------------------------------------------------- etapa 1: ¿responde?
 def probar(canal):
     """Devuelve latencia en segundos, o None si el stream no sirve."""
@@ -110,7 +189,7 @@ def probar(canal):
         return None
 
 
-# ------------------------------------------------- etapa 2: ¿es estable?
+# ------------------------------------------------- etapa 2: ¿es bueno?
 def leer_hls(url, h):
     """Devuelve (texto, url_base, variante_fijada) de la lista de medios.
 
@@ -183,9 +262,19 @@ def estable_hls(url, h):
     segs, seq, fin = parsear_media(texto, base)
     if fin or len(segs) < 2:  # VOD o lista sin contenido: no es en vivo
         return None
+    if max(d for _, d in segs) > MAX_SEG_DUR:  # arranque lento
+        return None
 
-    ratios, bitrates = [], []
-    for uri, dur in segs[-3:]:
+    llaves = [l for l in texto.splitlines()
+              if l.startswith("#EXT-X-KEY") and "METHOD=NONE" not in l]
+    if any("SAMPLE-AES" in l for l in llaves):
+        return None  # cifrado que los reproductores simples no abren
+    cifrado = bool(llaves)  # AES-128: no se puede inspeccionar, se acepta
+
+    elegidos = segs[-3:]
+    ratios, bitrates, muestra = [], [], b""
+    for n, (uri, dur) in enumerate(elegidos):
+        ultimo = n == len(elegidos) - 1
         t0 = time.time()
         r = get(uri, h, timeout=12, stream=True)
         if r.status_code != 200:
@@ -193,6 +282,8 @@ def estable_hls(url, h):
         total = 0
         for chunk in r.iter_content(65536):
             total += len(chunk)
+            if ultimo and len(muestra) < 800_000:
+                muestra += chunk
             if total > 8_000_000:
                 break
         r.close()
@@ -201,10 +292,23 @@ def estable_hls(url, h):
         ratios.append((time.time() - t0) / max(dur, 1.0))
         bitrates.append(total * 8 / max(dur, 1.0))
     media = sum(ratios) / len(ratios)
-    if media > RATIO_MAX or max(ratios) > 1.2:
+    if media > RATIO_MAX or max(ratios) > RATIO_PICO:
         return None
     if sum(bitrates) / len(bitrates) > MAX_BITRATE:  # demasiado pesado
         return None
+
+    # ¿trae video Y audio que el teléfono reproduce?
+    if not cifrado:
+        ts = analizar_ts(muestra)
+        if ts is None:  # no es MPEG-TS: probar fMP4/CMAF
+            mapa = re.search(r'#EXT-X-MAP:.*URI="([^"]+)"', texto)
+            if not mapa:
+                return None
+            ri = get(urljoin(base, mapa.group(1)), h, timeout=10)
+            if ri.status_code != 200 or not analizar_mp4(ri.content):
+                return None
+        elif not ts:
+            return None
 
     # el en vivo debe avanzar (los canales "pegados" repiten lo mismo)
     time.sleep(min(max(d for _, d in segs) * 1.5, 14))
@@ -228,13 +332,15 @@ def estable_directo(url, h):
     if r.status_code != 200:
         return None
     cubos = [0] * VENTANA
-    total = 0
+    total, muestra = 0, b""
     for chunk in r.iter_content(16384):
         dt = time.time() - t0
         if dt >= VENTANA:
             break
         cubos[int(dt)] += len(chunk)
         total += len(chunk)
+        if len(muestra) < 800_000:
+            muestra += chunk
     r.close()
     if sum(1 for c in cubos if c > 0) < VENTANA - 2:
         return None
@@ -244,6 +350,8 @@ def estable_directo(url, h):
     mitad = VENTANA // 2
     cola = sum(cubos[mitad:]) / (VENTANA - mitad) / 1024
     if cola > MAX_KBPS:  # demasiado pesado para tu conexión
+        return None
+    if analizar_ts(muestra) is False:  # TS sin video o sin audio útil
         return None
     return kbps, url
 
@@ -296,13 +404,13 @@ def main():
     vivos = [c for _, c in correr(probar, canales, HILOS, "etapa 1")]
     print(f"  {len(vivos)} responden.")
 
-    print("Etapa 2: ¿son estables y livianos? (tarda más)")
-    estables = correr(prueba_estable, vivos, HILOS_ESTABLE, "etapa 2")
-    print(f"  {len(estables)} pasan.")
+    print("Etapa 2: ¿estables, livianos y con video y audio? (tarda más)")
+    buenos = correr(prueba_estable, vivos, HILOS_ESTABLE, "etapa 2")
+    print(f"  {len(buenos)} pasan.")
 
     # una fuente por canal: la de mejor puntuación
     mejores = {}
-    for (score, url_final), c in sorted(estables, key=lambda x: -x[0][0]):
+    for (score, url_final), c in sorted(buenos, key=lambda x: -x[0][0]):
         mejores.setdefault(clave_canal(c), dict(c, url=url_final))
 
     with open(SALIDA, "w", encoding="utf-8") as f:
