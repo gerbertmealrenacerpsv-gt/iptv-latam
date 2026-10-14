@@ -1,0 +1,23 @@
+name: Actualizar lista IPTV
+on:
+  schedule:
+    - cron: "0 10 * * *"   # todos los días, 4:00 a.m. Guatemala
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install requests
+      - run: python mejorar_iptv.py
+      - run: |
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git add iptv_latam_limpia.m3u
+          git diff --cached --quiet || git commit -m "Actualizar lista"
+          git push
