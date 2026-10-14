@@ -42,6 +42,7 @@ MAX_KBPS = MAX_BITRATE / 8 / 1024 * 1.3  # tope en streams directos (KB/s)
 RATIO_MAX = 0.6       # tiempo de descarga / duración del fragmento (promedio)
 RATIO_PICO = 1.0      # ningún fragmento puede tardar más de lo que dura
 MAX_SEG_DUR = 12      # fragmentos más largos hacen lento el arranque
+FUENTES_POR_CANAL = 2  # alternativas por canal (si una falla, usa la otra)
 VENTANA = 8           # segundos de prueba para streams directos
 KBPS_MIN = 30         # velocidad mínima sostenida en streams directos
 
@@ -102,8 +103,8 @@ def _sync(data):
 
 
 def analizar_ts(data):
-    """None si `data` no es MPEG-TS. Si lo es, True/False según traiga video
-    y audio reproducibles (con datos reales de ambos)."""
+    """None si `data` no es MPEG-TS. Si lo es, devuelve (hay_video, hay_audio)
+    con códecs reproducibles y datos reales."""
     off = _sync(data)
     if off is None:
         return None
@@ -149,7 +150,7 @@ def analizar_ts(data):
                 for pid, st in streams.items())
     audio = any(st in AUDIO_OK and datos.get(pid, 0) > 0
                 for pid, st in streams.items())
-    return video and audio
+    return video, audio
 
 
 def analizar_mp4(data):
@@ -199,8 +200,12 @@ def leer_hls(url, h):
     r = get(url, h)
     if r.status_code != 200 or "#EXTM3U" not in r.text:
         return None
-    texto, base, fijada = r.text, r.url, None
+    texto, base, fijada, separado = r.text, r.url, None, False
     if "#EXT-X-STREAM-INF" in texto:
+        # ¿el audio viene en pistas aparte (varios idiomas)? Entonces el video
+        # solo no es un error: el reproductor suma la pista de audio.
+        separado = bool(re.search(
+            r"#EXT-X-MEDIA:[^\n]*TYPE=AUDIO[^\n]*URI=", texto))
         lineas = texto.splitlines()
         variantes = []
         for i, l in enumerate(lineas):
@@ -230,7 +235,7 @@ def leer_hls(url, h):
         if r.status_code != 200:
             return None
         texto, base, fijada = r.text, r.url, elegido
-    return texto, base, fijada
+    return texto, base, fijada, separado
 
 
 def parsear_media(texto, base):
@@ -258,7 +263,7 @@ def estable_hls(url, h):
     res = leer_hls(url, h)
     if not res:
         return None
-    texto, base, fijada = res
+    texto, base, fijada, separado = res
     segs, seq, fin = parsear_media(texto, base)
     if fin or len(segs) < 2:  # VOD o lista sin contenido: no es en vivo
         return None
@@ -307,8 +312,10 @@ def estable_hls(url, h):
             ri = get(urljoin(base, mapa.group(1)), h, timeout=10)
             if ri.status_code != 200 or not analizar_mp4(ri.content):
                 return None
-        elif not ts:
-            return None
+        else:
+            video, audio = ts
+            if not video or not (audio or separado):
+                return None
 
     # el en vivo debe avanzar (los canales "pegados" repiten lo mismo)
     time.sleep(min(max(d for _, d in segs) * 1.5, 14))
@@ -321,9 +328,10 @@ def estable_hls(url, h):
     if seq2 <= seq and segs2[-1][0] == segs[-1][0]:
         return None
 
-    # si hay varias calidades, fijar la liviana (si su URL no usa token)
-    url_final = fijada if fijada and "?" not in fijada else url
-    return 1.0 / max(media, 0.01), url_final
+    # Se conserva la URL ORIGINAL (lista maestra): así el reproductor puede
+    # cambiar de pista de audio, adaptar la calidad y renovar sus tokens.
+    # Fijar una variante rompía eso y hacía que el canal se parara a los minutos.
+    return 1.0 / max(media, 0.01), url
 
 
 def estable_directo(url, h):
@@ -351,7 +359,8 @@ def estable_directo(url, h):
     cola = sum(cubos[mitad:]) / (VENTANA - mitad) / 1024
     if cola > MAX_KBPS:  # demasiado pesado para tu conexión
         return None
-    if analizar_ts(muestra) is False:  # TS sin video o sin audio útil
+    ts = analizar_ts(muestra)
+    if ts is not None and not (ts[0] and ts[1]):  # sin video o sin audio útil
         return None
     return kbps, url
 
@@ -408,19 +417,24 @@ def main():
     buenos = correr(prueba_estable, vivos, HILOS_ESTABLE, "etapa 2")
     print(f"  {len(buenos)} pasan.")
 
-    # una fuente por canal: la de mejor puntuación
-    mejores = {}
+    # hasta FUENTES_POR_CANAL fuentes por canal (la mejor primero), para tener
+    # una alternativa si la primera falla desde tu ubicación
+    por_canal = {}
     for (score, url_final), c in sorted(buenos, key=lambda x: -x[0][0]):
-        mejores.setdefault(clave_canal(c), dict(c, url=url_final))
+        lista = por_canal.setdefault(clave_canal(c), [])
+        if (len(lista) < FUENTES_POR_CANAL
+                and all(x["url"] != url_final for x in lista)):
+            lista.append(dict(c, url=url_final))
+    mejores = [c for lista in por_canal.values() for c in lista]
 
     with open(SALIDA, "w", encoding="utf-8") as f:
         f.write("#EXTM3U\n")
-        for c in sorted(mejores.values(), key=lambda c: c["extinf"].split(",")[-1]):
+        for c in sorted(mejores, key=lambda c: c["extinf"].split(",")[-1]):
             f.write(c["extinf"] + "\n")
             for o in c["opts"]:
                 f.write(o + "\n")
             f.write(c["url"] + "\n")
-    print(f"Listo: {len(mejores)} canales -> {SALIDA}")
+    print(f"Listo: {len(por_canal)} canales ({len(mejores)} fuentes) -> {SALIDA}")
 
 
 if __name__ == "__main__":
